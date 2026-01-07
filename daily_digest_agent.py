@@ -1,174 +1,298 @@
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from Bio import Entrez
-from datetime import datetime, timedelta
 import os
+import smtplib
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-# --- CONFIGURATION: Reading from Environment Variables for Security ---
-# These are loaded from GitHub Secrets (or environment variables in PythonAnywhere)
+from Bio import Entrez
+
+
+# =========================================================
+# Config (from environment variables / GitHub Secrets)
+# =========================================================
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD") 
-# EMAIL_RECEIVER_STR handles multiple recipients passed as a comma-separated string
-EMAIL_RECEIVER_STR = os.environ.get("EMAIL_RECEIVER") 
-ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL") 
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
+EMAIL_RECEIVER_STR = os.environ.get("EMAIL_RECEIVER")
+ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
+
+DIGEST_TITLE = "Yadi's Daily Biostatistics & Genomics Digest"
 
 # Convert the receiver string to a list of emails for smtplib.sendmail()
 if EMAIL_RECEIVER_STR:
-    EMAIL_RECEIVER = [e.strip() for e in EMAIL_RECEIVER_STR.split(',')]
+    EMAIL_RECEIVER = [e.strip() for e in EMAIL_RECEIVER_STR.split(",") if e.strip()]
 else:
     EMAIL_RECEIVER = []
 
-# Search Keywords (can be updated here or made an environment variable)
-KEYWORDS = ["pulmonary hypertension", "pulmonary arterial hypertension", "right heart failure", "lung endothelial dysfunction"]
-# ---------------------
+# =========================================================
+# Topics: ONLY scRNA + genomics statistical methods
+# Each topic will select at most 1 paper from yesterday
+# =========================================================
 
-def fetch_articles():
-    if not ENTREZ_EMAIL:
-        print("Error: ENTREZ_EMAIL not set.")
+# Topic-specific terms (domain anchor)
+TOPICS = {
+    "Single-cell statistical methods": [
+        "single-cell RNA-seq", "scRNA-seq", "single-cell transcriptomics",
+        "cell type annotation", "trajectory inference", "pseudotime",
+        "batch correction", "data integration", "dimensionality reduction",
+        "latent variable", "clustering"
+    ],
+    "Genomics statistical methods": [
+        "genome-wide association", "GWAS", "statistical genetics",
+        "fine-mapping", "polygenic risk score", "PRS",
+        "eQTL", "genomic prediction", "rare variant",
+        "high-dimensional", "genetic association"
+    ]
+}
+
+# Method-oriented terms (to avoid pure biology/atlas papers)
+# We keep it broad (Bayesian + high-dim + inference language).
+METHOD_TERMS = [
+    "statistical", "method", "methodology", "model", "modeling",
+    "inference", "estimation", "likelihood",
+    "bayesian", "posterior", "prior",
+    "regression", "penalized", "lasso", "sparse",
+    "variational", "expectation maximization", "EM",
+    "probabilistic", "latent", "optimization"
+]
+
+# Max PMIDs per topic to fetch (we will pick 1)
+CANDIDATE_RETMAX = 30
+
+
+def _yesterday_pub_date_str() -> str:
+    return (datetime.now() - timedelta(days=1)).strftime("%Y/%m/%d")
+
+
+def _or_clause_titleab_or_mesh(terms: list[str]) -> str:
+    """
+    (("t1"[Title/Abstract] OR "t1"[MeSH Terms]) OR ( ... ))
+    """
+    clauses = [f'("{t}"[Title/Abstract] OR "{t}"[MeSH Terms])' for t in terms]
+    return "(" + " OR ".join(clauses) + ")"
+
+
+def _or_clause_titleab(terms: list[str]) -> str:
+    """
+    ("m1"[Title/Abstract] OR "m2"[Title/Abstract] OR ...)
+    We use Title/Abstract for method terms to keep it interpretable and avoid over-broad MeSH.
+    """
+    clauses = [f'"{t}"[Title/Abstract]' for t in terms]
+    return "(" + " OR ".join(clauses) + ")"
+
+
+def _build_query(topic_terms: list[str], method_terms: list[str], pub_date: str) -> str:
+    topic_clause = _or_clause_titleab_or_mesh(topic_terms)
+    method_clause = _or_clause_titleab(method_terms)
+    # Yesterday-only publication date filter
+    return f"{topic_clause} AND {method_clause} AND {pub_date}[Date - Publication]"
+
+
+def _search_pmids(query: str) -> list[str]:
+    """
+    Search PubMed and return PMIDs. Sort by pub date (within yesterday, still deterministic).
+    """
+    handle = Entrez.esearch(
+        db="pubmed",
+        term=query,
+        retmax=CANDIDATE_RETMAX,
+        sort="pub+date"
+    )
+    record = Entrez.read(handle)
+    handle.close()
+    return record.get("IdList", [])
+
+
+def _fetch_article_details(pmids: list[str]) -> list[dict]:
+    if not pmids:
         return []
-        
-    Entrez.email = ENTREZ_EMAIL
-    
-    # Calculate date range (Yesterday)
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y/%m/%d")
-    
-    # Construct the PubMed query using OR operator for multiple terms
-    search_terms = [f'"{term}"[Title/Abstract]' for term in KEYWORDS]
-    pubmed_query_terms = " OR ".join(search_terms)
-    search_query = f'({pubmed_query_terms}) AND {yesterday}[Date - Publication]'
-    
-    print(f"Searching for articles matching: ({pubmed_query_terms}) published on {yesterday}...")
-    
-    try:
-        handle = Entrez.esearch(db="pubmed", term=search_query, retmax=20)
-        record = Entrez.read(handle)
-        handle.close()
-        
-        id_list = record["IdList"]
-        if not id_list:
-            print("No articles found in search results.")
-            return []
 
-        # Fetch details
-        handle = Entrez.efetch(db="pubmed", id=id_list, rettype="medline", retmode="xml")
-        articles = Entrez.read(handle)
-        handle.close()
-        
-    except Exception as e:
-        print(f"Error during PubMed API call: {e}")
-        return []
+    handle = Entrez.efetch(db="pubmed", id=",".join(pmids), rettype="medline", retmode="xml")
+    data = Entrez.read(handle)
+    handle.close()
 
-    digest_data = []
-    
-    for article in articles.get('PubmedArticle', []):
+    out = []
+    for article in data.get("PubmedArticle", []):
         try:
-            medline = article['MedlineCitation']['Article']
-            title = medline.get('ArticleTitle', 'No Title')
-            journal = medline.get('Journal', {}).get('Title', 'No Journal')
-            
-            # Get PMID and create Link
-            pmid = article['MedlineCitation']['PMID']
-            link = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            med = article["MedlineCitation"]["Article"]
+            title = med.get("ArticleTitle", "No Title")
+            journal = med.get("Journal", {}).get("Title", "No Journal")
 
-            # Author Logic
-            author_list = medline.get('AuthorList', [])
+            pmid = str(article["MedlineCitation"]["PMID"])
+            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+
+            author_list = med.get("AuthorList", [])
             if not author_list:
                 authors = "No Authors Listed"
             elif len(author_list) == 1:
-                authors = f"{author_list[0].get('LastName', '')} {author_list[0].get('Initials', '')}"
+                a0 = author_list[0]
+                authors = f"{a0.get('LastName', '')} {a0.get('Initials', '')}".strip()
             else:
-                first = f"{author_list[0].get('LastName', '')} {author_list[0].get('Initials', '')}"
-                last = f"{author_list[-1].get('LastName', '')} {author_list[-1].get('Initials', '')}"
-                authors = f"{first} ... {last}"
-            
-            digest_data.append({
-                'title': title,
-                'authors': authors,
-                'journal': journal,
-                'url': link
+                first = author_list[0]
+                last = author_list[-1]
+                first_str = f"{first.get('LastName', '')} {first.get('Initials', '')}".strip()
+                last_str = f"{last.get('LastName', '')} {last.get('Initials', '')}".strip()
+                authors = f"{first_str} ... {last_str}"
+
+            out.append({
+                "title": title,
+                "authors": authors,
+                "journal": journal,
+                "pmid": pmid,
+                "url": url,
             })
         except Exception as e:
-            print(f"Skipping article due to parsing error: {e}")
+            print(f"[WARN] Skipping article due to parsing error: {e}")
             continue
-            
-    return digest_data
 
-def format_html_email(data):
-    html = """
+    return out
+
+
+def fetch_one_per_topic() -> dict:
+    """
+    For each topic:
+      - query = (topic terms) AND (method terms) AND (yesterday)
+      - search PMIDs, fetch details
+      - pick 1 representative paper (first returned, deterministic)
+    """
+    if not ENTREZ_EMAIL:
+        print("Error: ENTREZ_EMAIL not set.")
+        return {}
+
+    Entrez.email = ENTREZ_EMAIL
+    yesterday = _yesterday_pub_date_str()
+
+    results = {}
+    for topic, topic_terms in TOPICS.items():
+        query = _build_query(topic_terms, METHOD_TERMS, yesterday)
+        print(f"\n=== Topic: {topic} ===")
+        print(f"Query: {query}")
+
+        try:
+            pmids = _search_pmids(query)
+            if not pmids:
+                print("No PMIDs found.")
+                results[topic] = {"article": None, "query": query}
+                continue
+
+            articles = _fetch_article_details(pmids)
+            if not articles:
+                print("PMIDs found, but no parsable article details.")
+                results[topic] = {"article": None, "query": query}
+                continue
+
+            results[topic] = {"article": articles[0], "query": query}
+            print(f"Selected PMID {articles[0]['pmid']}")
+        except Exception as e:
+            print(f"[ERROR] Topic '{topic}' failed: {e}")
+            results[topic] = {"article": None, "query": query}
+
+    return results
+
+
+def format_html_email(topic_payload: dict) -> str:
+    yesterday = _yesterday_pub_date_str()
+
+    html = f"""
     <html>
     <head>
     <style>
-        table {width: 100%; border-collapse: collapse; font-family: Arial, sans-serif;}
-        th {background-color: #003366; color: white; padding: 10px; text-align: left;}
-        td {border-bottom: 1px solid #ddd; padding: 8px; text-align: left; vertical-align: top;}
-        tr:nth-child(even) {background-color: #f2f2f2;}
-        .title {font-weight: bold; color: #0056b3; text-decoration: none;}
-        .title:hover {text-decoration: underline;}
-        .journal {font-style: italic; color: #666;}
+        body {{ font-family: Arial, sans-serif; }}
+        .meta {{ color: #555; margin-bottom: 12px; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th {{ background-color: #1f3b57; color: white; padding: 10px; text-align: left; }}
+        td {{ border-bottom: 1px solid #ddd; padding: 8px; vertical-align: top; }}
+        tr:nth-child(even) {{ background-color: #f6f7f9; }}
+        .title a {{ font-weight: bold; color: #0b5aa2; text-decoration: none; }}
+        .title a:hover {{ text-decoration: underline; }}
+        .topic {{ font-size: 16px; font-weight: bold; margin-top: 18px; }}
+        .none {{ color: #777; font-style: italic; }}
+        .query {{ margin: 6px 0 12px; font-size: 12px; color: #666; }}
+        code {{ background: #f0f0f0; padding: 2px 4px; border-radius: 4px; }}
+        .footer {{ margin-top: 18px; color: #666; font-size: 12px; }}
     </style>
     </head>
     <body>
-    <h2>Daily Dai Lab Literature Digest</h2>
-    <table>
-        <tr>
-            <th style="width: 50%;">Title (Click to Read)</th>
-            <th style="width: 25%;">First & Last Author</th>
-            <th style="width: 25%;">Journal</th>
-        </tr>
+      <h2>{DIGEST_TITLE}</h2>
+      <div class="meta">
+        Filter: <code>Published on {yesterday}</code> (yesterday only).<br/>
+        Selection: For each topic, we apply <code>(topic terms) AND (method terms)</code>, then pick 1 representative paper.
+      </div>
     """
-    
-    for row in data:
-        html += f"""
-        <tr>
-            <td><a href=\"{row['url']}\" class=\"title\">{row['title']}</a></td>
-            <td>{row['authors']}</td>
-            <td class=\"journal\">{row['journal']}</td>
-        </tr>
+
+    for topic in ["Single-cell statistical methods", "Genomics statistical methods"]:
+        payload = topic_payload.get(topic, {})
+        article = payload.get("article")
+        query = payload.get("query", "")
+
+        html += f'<div class="topic">{topic}</div>\n'
+        if query:
+            html += f'<div class="query">Query: <code>{query}</code></div>\n'
+
+        html += """
+        <table>
+          <tr>
+            <th style="width: 55%;">Title (click to read)</th>
+            <th style="width: 25%;">First & Last Author</th>
+            <th style="width: 20%;">Journal</th>
+          </tr>
         """
-        
+
+        if article is None:
+            html += f"""
+              <tr>
+                <td class="none" colspan="3">No paper found for this topic on {yesterday}.</td>
+              </tr>
+            """
+        else:
+            html += f"""
+              <tr>
+                <td class="title"><a href="{article['url']}">{article['title']}</a></td>
+                <td>{article['authors']}</td>
+                <td>{article['journal']}</td>
+              </tr>
+            """
+
+        html += "</table>\n"
+
     html += """
-    </table>
-    <p><em>Generated by Dr. Zhiyu Dai using Google Gemini and Github</em></p>
+      <div class="footer">
+        Generated automatically by Yadi's PubMed Digest Agent (GitHub Actions + NCBI Entrez).
+      </div>
     </body>
     </html>
     """
     return html
 
-def send_email(html_content):
+
+def send_email(html_content: str):
     if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
-        print("Error: Email credentials or receiver list not set.")
+        print("Error: EMAIL_SENDER / EMAIL_PASSWORD / EMAIL_RECEIVER not set (check GitHub Secrets).")
         return
 
     msg = MIMEMultipart()
-    msg['From'] = EMAIL_SENDER
-    # Use a comma-separated string for the 'To' header
-    msg['To'] = ", ".join(EMAIL_RECEIVER)
-    msg['Subject'] = f"Dai Lab Literature Digest: {KEYWORDS[0]} ({datetime.now().strftime('%Y-%m-%d')})"
-    
-    msg.attach(MIMEText(html_content, 'html'))
-    
+    msg["From"] = EMAIL_SENDER
+    msg["To"] = ", ".join(EMAIL_RECEIVER)
+    msg["Subject"] = f"Yadi PubMed Digest (scRNA + Genomics methods) — {datetime.now().strftime('%Y-%m-%d')}"
+
+    msg.attach(MIMEText(html_content, "html"))
+
     try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        # Pass the list of recipients to sendmail()
         server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
         server.quit()
         print(f"Email successfully sent to {', '.join(EMAIL_RECEIVER)}")
     except Exception as e:
         print(f"Failed to send email: {e}")
-        # Detailed error handling for authentication failure
-        if 'authentication failed' in str(e).lower():
-            print("Authentication failed. Ensure you are using a correct Google App Password, not your main account password.")
+        if "authentication" in str(e).lower():
+            print("Authentication failed: ensure EMAIL_PASSWORD is a Google App Password.")
+
 
 if __name__ == "__main__":
     if not EMAIL_PASSWORD or not ENTREZ_EMAIL:
-        print("Agent could not run. Check that EMAIL_PASSWORD and ENTREZ_EMAIL environment variables are set.")
+        print("Agent could not run. Check EMAIL_PASSWORD and ENTREZ_EMAIL environment variables.")
     else:
-        data = fetch_articles()
-        if data:
-            html = format_html_email(data)
-            send_email(html)
-        else:
-            print("No new articles found for yesterday. Email not sent.")
+        topic_payload = fetch_one_per_topic()
+        html = format_html_email(topic_payload)
+        send_email(html)
