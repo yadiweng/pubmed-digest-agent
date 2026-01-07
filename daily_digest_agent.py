@@ -21,7 +21,8 @@ DIGEST_TITLE = "Yadi's Daily Biostatistics & Genomics Digest"
 SHOW_QUERY = os.environ.get("SHOW_QUERY", "0") == "1"
 
 # Optional journal whitelist (comma-separated). If provided, prefer these journals.
-# Example: "Nature Methods,Genome Biology,Bioinformatics,Biostatistics,PNAS"
+# Example value:
+#   Nature Methods,Genome Biology,Nature Biotechnology,Bioinformatics,Biostatistics,PNAS,Nature Genetics
 JOURNAL_WHITELIST_STR = os.environ.get("JOURNAL_WHITELIST", "")
 JOURNAL_WHITELIST = {j.strip().lower() for j in JOURNAL_WHITELIST_STR.split(",") if j.strip()}
 
@@ -32,7 +33,7 @@ else:
     EMAIL_RECEIVER = []
 
 # =========================================================
-# Topics: use DOMAIN ANCHOR TERMS only (to prevent drift)
+# Topics: DOMAIN ANCHOR TERMS only (to prevent drift)
 # =========================================================
 TOPICS = {
     "Single-cell statistical methods": [
@@ -42,6 +43,7 @@ TOPICS = {
         "single-cell transcriptomics",
         "single cell transcriptomics",
         "single-cell sequencing",
+        "single cell sequencing",
     ],
     "Genomics statistical methods": [
         "genome-wide association",
@@ -55,7 +57,7 @@ TOPICS = {
     ],
 }
 
-# Method-oriented terms (AND condition)
+# Method-oriented terms (AND condition): general statistical language
 METHOD_TERMS = [
     "statistical", "method", "methodology", "model", "modeling",
     "inference", "estimation", "likelihood",
@@ -65,7 +67,26 @@ METHOD_TERMS = [
     "benchmark", "simulation", "algorithm"
 ]
 
-CANDIDATE_RETMAX = 30
+# "Method paper" terms (AND condition): signals this is a methods/tool/framework paper
+# Include verbs WITHOUT "we" to make matching more robust
+METHOD_PAPER_TERMS = [
+    "method", "methods", "methodology",
+    "propose", "develop", "introduce", "present", "approach",
+    "framework", "algorithm", "pipeline", "workflow",
+    "software", "tool", "package", "R package", "python package",
+    "benchmark", "simulation study", "evaluation", "open-source"
+]
+
+# Exclusion terms (NOT condition): reduce disease/clinical discovery papers
+# Keep it moderate—too aggressive will cause "no paper found" days.
+EXCLUDE_TERMS = [
+    "case report", "review", "systematic review", "meta-analysis",
+    "patient", "patients", "clinical trial", "randomized",
+    "cohort", "prognosis", "survival",
+    "glioma", "schizophrenia"
+]
+
+CANDIDATE_RETMAX = 200
 
 
 def _yesterday_pub_date_str() -> str:
@@ -82,10 +103,25 @@ def _or_clause_titleab(terms: list[str]) -> str:
     return "(" + " OR ".join(clauses) + ")"
 
 
-def _build_query(anchor_terms: list[str], method_terms: list[str], pub_date: str) -> str:
+def _build_query(anchor_terms: list[str], method_terms: list[str], method_paper_terms: list[str],
+                 exclude_terms: list[str], pub_date: str) -> str:
+    """
+    Query structure:
+      (anchor terms in Title/Abstract OR MeSH)
+      AND (method terms in Title/Abstract)
+      AND (method-paper terms in Title/Abstract)
+      AND NOT (exclude terms in Title/Abstract)
+      AND pub_date[Date - Publication]
+    """
     anchor_clause = _or_clause_titleab_or_mesh(anchor_terms)
     method_clause = _or_clause_titleab(method_terms)
-    return f"{anchor_clause} AND {method_clause} AND {pub_date}[Date - Publication]"
+    method_paper_clause = _or_clause_titleab(method_paper_terms)
+
+    exclude_clause = ""
+    if exclude_terms:
+        exclude_clause = " NOT " + _or_clause_titleab(exclude_terms)
+
+    return f"{anchor_clause} AND {method_clause} AND {method_paper_clause}{exclude_clause} AND {pub_date}[Date - Publication]"
 
 
 def _search_pmids(query: str) -> list[str]:
@@ -149,9 +185,9 @@ def _fetch_article_details(pmids: list[str]) -> list[dict]:
 def _select_best_article(articles: list[dict]) -> tuple[dict | None, str]:
     """
     Selection logic:
-      1) If JOURNAL_WHITELIST is non-empty: pick first article whose journal is in whitelist.
-      2) Else pick first article.
-    Return (article_or_none, note_string).
+      1) If JOURNAL_WHITELIST non-empty: pick first article whose journal is in whitelist.
+      2) Else: pick first article.
+    Returns (article_or_none, note_string).
     """
     if not articles:
         return None, "No paper found."
@@ -160,7 +196,6 @@ def _select_best_article(articles: list[dict]) -> tuple[dict | None, str]:
         for a in articles:
             if a["journal_lc"] in JOURNAL_WHITELIST:
                 return a, "Preferred journal."
-        # fallback
         return articles[0], "Non-preferred journal (fallback)."
 
     return articles[0], "No journal filter."
@@ -176,7 +211,14 @@ def fetch_one_per_topic() -> dict:
 
     results = {}
     for topic, anchor_terms in TOPICS.items():
-        query = _build_query(anchor_terms, METHOD_TERMS, yesterday)
+        query = _build_query(
+            anchor_terms=anchor_terms,
+            method_terms=METHOD_TERMS,
+            method_paper_terms=METHOD_PAPER_TERMS,
+            exclude_terms=EXCLUDE_TERMS,
+            pub_date=yesterday
+        )
+
         print(f"\n=== Topic: {topic} ===")
         print(f"Query: {query}")
 
@@ -219,7 +261,7 @@ def format_html_email(topic_payload: dict) -> str:
       <h2>{DIGEST_TITLE}</h2>
       <div class="meta">
         Filter: <code>Published on {yesterday}</code> (yesterday only).<br/>
-        Selection: <code>(anchor terms) AND (method terms)</code>, then pick 1 representative paper per topic.
+        Selection: <code>(anchor) AND (stats/method) AND (method-paper signals) AND NOT (clinical/discovery signals)</code>, then pick 1 paper per topic.
       </div>
     """
 
