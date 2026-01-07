@@ -33,5 +33,6 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }} # Comma-separated string of emails
           ENTREZ_EMAIL: ${{ secrets.ENTREZ_EMAIL }}
+          JOURNAL_WHITELIST: ${{ secrets.JOURNAL_WHITELIST }}
           # ---------------------------------------
         run: python daily_digest_agent.py
