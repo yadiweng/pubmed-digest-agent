@@ -17,45 +17,54 @@ ENTREZ_EMAIL = os.environ.get("ENTREZ_EMAIL")
 
 DIGEST_TITLE = "Yadi's Daily Biostatistics & Genomics Digest"
 
-# Convert the receiver string to a list of emails for smtplib.sendmail()
+# Debug flag: if set to "1", include long queries in email (default OFF)
+SHOW_QUERY = os.environ.get("SHOW_QUERY", "0") == "1"
+
+# Optional journal whitelist (comma-separated). If provided, prefer these journals.
+# Example: "Nature Methods,Genome Biology,Bioinformatics,Biostatistics,PNAS"
+JOURNAL_WHITELIST_STR = os.environ.get("JOURNAL_WHITELIST", "")
+JOURNAL_WHITELIST = {j.strip().lower() for j in JOURNAL_WHITELIST_STR.split(",") if j.strip()}
+
+# Convert receiver string to list
 if EMAIL_RECEIVER_STR:
     EMAIL_RECEIVER = [e.strip() for e in EMAIL_RECEIVER_STR.split(",") if e.strip()]
 else:
     EMAIL_RECEIVER = []
 
 # =========================================================
-# Topics: ONLY scRNA + genomics statistical methods
-# Each topic will select at most 1 paper from yesterday
+# Topics: use DOMAIN ANCHOR TERMS only (to prevent drift)
 # =========================================================
-
-# Topic-specific terms (domain anchor)
 TOPICS = {
     "Single-cell statistical methods": [
-        "single-cell RNA-seq", "scRNA-seq", "single-cell transcriptomics",
-        "cell type annotation", "trajectory inference", "pseudotime",
-        "batch correction", "data integration", "dimensionality reduction",
-        "latent variable", "clustering"
+        "scRNA-seq",
+        "single-cell RNA-seq",
+        "single cell RNA-seq",
+        "single-cell transcriptomics",
+        "single cell transcriptomics",
+        "single-cell sequencing",
     ],
     "Genomics statistical methods": [
-        "genome-wide association", "GWAS", "statistical genetics",
-        "fine-mapping", "polygenic risk score", "PRS",
-        "eQTL", "genomic prediction", "rare variant",
-        "high-dimensional", "genetic association"
-    ]
+        "genome-wide association",
+        "GWAS",
+        "eQTL",
+        "expression quantitative trait locus",
+        "fine-mapping",
+        "polygenic risk score",
+        "polygenic risk",
+        "statistical genetics",
+    ],
 }
 
-# Method-oriented terms (to avoid pure biology/atlas papers)
-# We keep it broad (Bayesian + high-dim + inference language).
+# Method-oriented terms (AND condition)
 METHOD_TERMS = [
     "statistical", "method", "methodology", "model", "modeling",
     "inference", "estimation", "likelihood",
     "bayesian", "posterior", "prior",
     "regression", "penalized", "lasso", "sparse",
-    "variational", "expectation maximization", "EM",
-    "probabilistic", "latent", "optimization"
+    "variational", "probabilistic", "optimization",
+    "benchmark", "simulation", "algorithm"
 ]
 
-# Max PMIDs per topic to fetch (we will pick 1)
 CANDIDATE_RETMAX = 30
 
 
@@ -64,33 +73,22 @@ def _yesterday_pub_date_str() -> str:
 
 
 def _or_clause_titleab_or_mesh(terms: list[str]) -> str:
-    """
-    (("t1"[Title/Abstract] OR "t1"[MeSH Terms]) OR ( ... ))
-    """
     clauses = [f'("{t}"[Title/Abstract] OR "{t}"[MeSH Terms])' for t in terms]
     return "(" + " OR ".join(clauses) + ")"
 
 
 def _or_clause_titleab(terms: list[str]) -> str:
-    """
-    ("m1"[Title/Abstract] OR "m2"[Title/Abstract] OR ...)
-    We use Title/Abstract for method terms to keep it interpretable and avoid over-broad MeSH.
-    """
     clauses = [f'"{t}"[Title/Abstract]' for t in terms]
     return "(" + " OR ".join(clauses) + ")"
 
 
-def _build_query(topic_terms: list[str], method_terms: list[str], pub_date: str) -> str:
-    topic_clause = _or_clause_titleab_or_mesh(topic_terms)
+def _build_query(anchor_terms: list[str], method_terms: list[str], pub_date: str) -> str:
+    anchor_clause = _or_clause_titleab_or_mesh(anchor_terms)
     method_clause = _or_clause_titleab(method_terms)
-    # Yesterday-only publication date filter
-    return f"{topic_clause} AND {method_clause} AND {pub_date}[Date - Publication]"
+    return f"{anchor_clause} AND {method_clause} AND {pub_date}[Date - Publication]"
 
 
 def _search_pmids(query: str) -> list[str]:
-    """
-    Search PubMed and return PMIDs. Sort by pub date (within yesterday, still deterministic).
-    """
     handle = Entrez.esearch(
         db="pubmed",
         term=query,
@@ -137,6 +135,7 @@ def _fetch_article_details(pmids: list[str]) -> list[dict]:
                 "title": title,
                 "authors": authors,
                 "journal": journal,
+                "journal_lc": journal.lower(),
                 "pmid": pmid,
                 "url": url,
             })
@@ -147,13 +146,27 @@ def _fetch_article_details(pmids: list[str]) -> list[dict]:
     return out
 
 
+def _select_best_article(articles: list[dict]) -> tuple[dict | None, str]:
+    """
+    Selection logic:
+      1) If JOURNAL_WHITELIST is non-empty: pick first article whose journal is in whitelist.
+      2) Else pick first article.
+    Return (article_or_none, note_string).
+    """
+    if not articles:
+        return None, "No paper found."
+
+    if JOURNAL_WHITELIST:
+        for a in articles:
+            if a["journal_lc"] in JOURNAL_WHITELIST:
+                return a, "Preferred journal."
+        # fallback
+        return articles[0], "Non-preferred journal (fallback)."
+
+    return articles[0], "No journal filter."
+
+
 def fetch_one_per_topic() -> dict:
-    """
-    For each topic:
-      - query = (topic terms) AND (method terms) AND (yesterday)
-      - search PMIDs, fetch details
-      - pick 1 representative paper (first returned, deterministic)
-    """
     if not ENTREZ_EMAIL:
         print("Error: ENTREZ_EMAIL not set.")
         return {}
@@ -162,29 +175,19 @@ def fetch_one_per_topic() -> dict:
     yesterday = _yesterday_pub_date_str()
 
     results = {}
-    for topic, topic_terms in TOPICS.items():
-        query = _build_query(topic_terms, METHOD_TERMS, yesterday)
+    for topic, anchor_terms in TOPICS.items():
+        query = _build_query(anchor_terms, METHOD_TERMS, yesterday)
         print(f"\n=== Topic: {topic} ===")
         print(f"Query: {query}")
 
         try:
             pmids = _search_pmids(query)
-            if not pmids:
-                print("No PMIDs found.")
-                results[topic] = {"article": None, "query": query}
-                continue
-
             articles = _fetch_article_details(pmids)
-            if not articles:
-                print("PMIDs found, but no parsable article details.")
-                results[topic] = {"article": None, "query": query}
-                continue
-
-            results[topic] = {"article": articles[0], "query": query}
-            print(f"Selected PMID {articles[0]['pmid']}")
+            picked, note = _select_best_article(articles)
+            results[topic] = {"article": picked, "note": note, "query": query}
         except Exception as e:
             print(f"[ERROR] Topic '{topic}' failed: {e}")
-            results[topic] = {"article": None, "query": query}
+            results[topic] = {"article": None, "note": f"Error: {e}", "query": query}
 
     return results
 
@@ -206,6 +209,7 @@ def format_html_email(topic_payload: dict) -> str:
         .title a:hover {{ text-decoration: underline; }}
         .topic {{ font-size: 16px; font-weight: bold; margin-top: 18px; }}
         .none {{ color: #777; font-style: italic; }}
+        .note {{ font-size: 12px; color: #666; margin: 6px 0 10px; }}
         .query {{ margin: 6px 0 12px; font-size: 12px; color: #666; }}
         code {{ background: #f0f0f0; padding: 2px 4px; border-radius: 4px; }}
         .footer {{ margin-top: 18px; color: #666; font-size: 12px; }}
@@ -215,17 +219,20 @@ def format_html_email(topic_payload: dict) -> str:
       <h2>{DIGEST_TITLE}</h2>
       <div class="meta">
         Filter: <code>Published on {yesterday}</code> (yesterday only).<br/>
-        Selection: For each topic, we apply <code>(topic terms) AND (method terms)</code>, then pick 1 representative paper.
+        Selection: <code>(anchor terms) AND (method terms)</code>, then pick 1 representative paper per topic.
       </div>
     """
 
     for topic in ["Single-cell statistical methods", "Genomics statistical methods"]:
         payload = topic_payload.get(topic, {})
         article = payload.get("article")
+        note = payload.get("note", "")
         query = payload.get("query", "")
 
         html += f'<div class="topic">{topic}</div>\n'
-        if query:
+        if note:
+            html += f'<div class="note">Selection note: <code>{note}</code></div>\n'
+        if SHOW_QUERY and query:
             html += f'<div class="query">Query: <code>{query}</code></div>\n'
 
         html += """
@@ -273,7 +280,6 @@ def send_email(html_content: str):
     msg["From"] = EMAIL_SENDER
     msg["To"] = ", ".join(EMAIL_RECEIVER)
     msg["Subject"] = f"Yadi PubMed Digest (scRNA + Genomics methods) — {datetime.now().strftime('%Y-%m-%d')}"
-
     msg.attach(MIMEText(html_content, "html"))
 
     try:
